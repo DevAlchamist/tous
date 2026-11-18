@@ -1,0 +1,479 @@
+package com.nareshjagriya.tvtown;
+
+import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.os.Bundle;
+import android.os.SystemClock;
+import android.text.StaticLayout;
+import android.text.TextPaint;
+import android.text.TextUtils;
+import android.view.KeyEvent;
+import android.view.View;
+import android.widget.Toast;
+
+import androidx.annotation.Nullable;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
+/**
+ * The film page, one for the whole launcher: the title's art over the whole screen, its logo, a glass panel with its
+ * story and cast, where to watch it, and everything you can do with it. Replaces the separate pop-ups.
+ */
+public class TitleActivity extends Activity {
+
+    @Override
+    protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(Lang.wrap(base));   // the language chosen in Customize
+    }
+
+    /** The title being opened: too rich for an Intent, and only ever one at a time. */
+    private static Tmdb.Title pending;
+
+    static void open(Context ctx, Tmdb.Title t) {
+        pending = t;
+        Intent i = new Intent(ctx, TitleActivity.class);
+        if (!(ctx instanceof Activity)) i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        ctx.startActivity(i);
+    }
+
+    private Page page;
+
+    @Override
+    protected void onCreate(Bundle state) {
+        super.onCreate(state);
+        Tmdb.Title t = pending;
+        if (t == null) {
+            finish();
+            return;
+        }
+        page = new Page(this, t);
+        setContentView(page);
+        page.setFocusable(true);
+        page.requestFocus();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (page != null) page.invalidate();   // what you marked may have changed elsewhere
+    }
+
+    private void play(Tmdb.Title t, Services.Service s) {
+        Toast.makeText(this, getString(R.string.opening, t.title), Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            DeepLinks.Plan plan = DeepLinks.plan(this, t, s);
+            runOnUiThread(() -> {
+                if (plan.intent == null) {
+                    Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                if (plan.outcome == DeepLinks.Outcome.APP) {
+                    Toast.makeText(this, getString(R.string.opened_app_search, s.name, t.title), Toast.LENGTH_LONG).show();
+                } else if (plan.outcome == DeepLinks.Outcome.STORE) {
+                    Toast.makeText(this, getString(R.string.get_app_first, s.name), Toast.LENGTH_LONG).show();
+                }
+                start(plan.intent);
+            });
+        }, "open-title").start();
+    }
+
+    /** Opens the title's own page in Stremio or Nuvio. */
+    private void playIn(Tmdb.Title t, String which) {
+        Toast.makeText(this, getString(R.string.opening, t.title), Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            Intent i = OpenIn.intent(this, t, which);
+            runOnUiThread(() -> {
+                if (i == null) Toast.makeText(this, getString(R.string.not_in_app, t.title, OpenIn.name(which)), Toast.LENGTH_LONG).show();
+                else start(i);
+            });
+        }, "open-in").start();
+    }
+
+    private void trailer(Tmdb.Title t) {
+        new Thread(() -> {
+            Intent i = DeepLinks.trailer(this, t);
+            runOnUiThread(() -> start(i));
+        }, "trailer").start();
+    }
+
+    private void start(@Nullable Intent i) {
+        if (i == null) {
+            Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        } catch (ActivityNotFoundException | SecurityException e) {
+            Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private static final class Page extends View {
+
+        private static final int B_PLAY = 0, B_TRAILER = 1, B_LIST = 2, B_WATCHED = 3, B_RATE = 4;
+        private static final float BOX_L = 80, BOX_T = 500, BOX_W = 1340, BOX_H = 540, BTN_Y = 950, BTN_H = 68;
+
+        private final TitleActivity act;
+        private final Tmdb.Title t;
+        private final float k;
+        private final ArtStage stage;
+        private final NoirKit nk;
+        private final GlassKit kit;
+        private final Paint iconPaint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
+        private final Paint title, name, meta, body, label, btn;
+        private static final float POSTER_W = 300, TEXT_L = BOX_L + 36 + POSTER_W + 40;   // the cover on the left, the words beside it
+        private List<Services.Service> where = new ArrayList<>();
+        private String cast = "";
+        private boolean whereKnown;
+        private int row = 1, sel, app;   // row 0: the apps; row 1: the buttons
+        private boolean rating;
+        private int ratingValue, ratingWas;
+        private float rateFrom, rateTo;   // the glider: from one number to the next
+        private long rateAt;
+        private StaticLayout story;
+        /** Stremio or Nuvio, when chosen in Customize; and the one installed, for titles no streaming app has. */
+        private final String chosenIn, alt;
+
+        @androidx.annotation.Nullable
+        private String inWhich() {
+            if (!OpenIn.APPS.equals(chosenIn)) return chosenIn;
+            return where.isEmpty() && whereKnown ? alt : null;
+        }
+
+        private boolean playable() {
+            return inWhich() != null || !where.isEmpty();
+        }
+
+        Page(TitleActivity act, Tmdb.Title t) {
+            super(act);
+            this.act = act;
+            this.t = t;
+            chosenIn = OpenIn.chosen(act);
+            alt = OpenIn.fallback(act);
+            k = act.getResources().getDisplayMetrics().widthPixels / 1920f;
+            stage = new ArtStage(this);
+            nk = new NoirKit(act, k);
+            kit = new GlassKit(act, null, k);
+            title = shade(nk.inter(88, 700, 0, Color.WHITE));
+            name = nk.inter(46, 700, -0.01f, Color.WHITE);
+            meta = nk.inter(24, 500, 0, Color.WHITE);
+            body = nk.inter(30, 400, 0, Color.WHITE);
+            label = nk.inter(24, 400, 0, Frost.MUTE);
+            btn = nk.inter(24, 500, 0, Color.WHITE);
+            String art = t.backdropLarge();
+            stage.show(art != null ? art : t.poster());
+            if (t.logoUrl != null) t.logoDone = true;
+            t.logoAskedAt = SystemClock.uptimeMillis();
+            new Thread(this::load, "title").start();
+        }
+
+        private Paint shade(Paint p) {
+            p.setShadowLayer(4 * k, 0, 1 * k, 0x8C000000);
+            return p;
+        }
+
+        private void load() {
+            Context ctx = getContext();
+            try {
+                Catalog.details(ctx, t);
+            } catch (RuntimeException ignored) {
+                // shown without them
+            }
+            if (t.logoUrl == null) t.logoUrl = Catalog.logo(ctx, t);
+            t.logoDone = true;
+            String names = Catalog.cast(ctx, t);
+            List<Services.Service> w = new ArrayList<>();
+            try {
+                w.addAll(Catalog.whereToWatch(ctx, t));
+            } catch (Exception ignored) {
+                // nothing known
+            }
+            // Your own apps first, the one it was found on leading.
+            List<Services.Service> sorted = new ArrayList<>();
+            if (t.service != null) sorted.add(t.service);
+            for (Services.Service s : w) if (!sorted.contains(s) && Services.installed(ctx, s.pkg)) sorted.add(s);
+            for (Services.Service s : w) if (!sorted.contains(s)) sorted.add(s);
+            post(() -> {
+                where = sorted;
+                cast = names;
+                whereKnown = true;
+                story = null;
+                if (sel == B_PLAY && !playable()) sel = B_TRAILER;
+                invalidate();
+            });
+        }
+
+        private String buttonText(int b) {
+            Library.Entry e = Library.get(getContext(), t);
+            switch (b) {
+                case B_PLAY:
+                    if (inWhich() != null) return L10n.t("Play in ") + OpenIn.name(inWhich());
+                    return where.isEmpty() ? (whereKnown ? L10n.t("Not streaming") : L10n.t("Finding where…")) : L10n.t("Play on ") + where.get(Math.min(app, where.size() - 1)).name;
+                case B_TRAILER:
+                    return L10n.t("Trailer");
+                case B_LIST:
+                    return e != null && e.status == Library.WANT ? L10n.t("✓ My List") : L10n.t("+ My List");
+                case B_WATCHED:
+                    return e != null && e.status == Library.WATCHED ? L10n.t("✓ Watched") : L10n.t("Watched");
+                default:
+                    return e != null && e.rating > 0 ? "★ " + e.rating : L10n.t("Rate");
+            }
+        }
+
+        private RectF buttonRect(int b) {
+            float x = TEXT_L;
+            for (int i = 0; i < b; i++) x += btnW(i) + 12;
+            return new RectF(x * k, BTN_Y * k, (x + btnW(b)) * k, (BTN_Y + BTN_H) * k);
+        }
+
+        /** The one main button, in the jewel colour with an icon: Play, or Trailer when it isn't streaming anywhere. */
+        private boolean main(int b) {
+            return playable() ? b == B_PLAY : b == B_TRAILER;
+        }
+
+        private float btnW(int b) {
+            return btn.measureText(buttonText(b)) / k + 64 + (main(b) ? 38 : 0);
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            Frost.frame(this);   // selections glide (Frost.plate)
+            long now = SystemClock.uptimeMillis();
+            stage.draw(c, now);
+            boolean logoShown = drawName(c);
+            RectF box = new RectF(BOX_L * k, BOX_T * k, (BOX_L + BOX_W) * k, (BOX_T + BOX_H) * k);
+            Frost.panel(c, box, 44 * k, 1, k);   // the shiny black pop-up
+
+            drawCover(c);
+            float x = TEXT_L * k, room = (BOX_L + BOX_W - 36 - TEXT_L) * k, y = (BOX_T + 72) * k;
+            if (logoShown) y = (BOX_T + 56) * k;   // its logo is right above: the name isn't said twice
+            else {
+                float was = name.getTextSize();
+                if (name.measureText(t.title) > room) name.setTextSize(Math.max(was * 0.7f, was * room / name.measureText(t.title)));
+                c.drawText(fit(t.title, name, room), x, y, name);
+                name.setTextSize(was);
+                y += 46 * k;
+            }
+            c.drawText(fit(metaLine(), meta, room), x, y, meta);
+            String ov = t.overview == null ? "" : t.overview;
+            if (story == null) {
+                story = StaticLayout.Builder.obtain(ov, 0, ov.length(), new TextPaint(body), Math.round(room)).setMaxLines(where.size() > 1 ? 4 : 6)
+                        .setEllipsize(TextUtils.TruncateAt.END).setLineSpacing(6 * k, 1).build();
+            }
+            c.save();
+            c.translate(x, y + 20 * k);
+            story.draw(c);
+            c.restore();
+            y += 20 * k + story.getHeight() + 40 * k;
+            if (!cast.isEmpty()) c.drawText(fit(L10n.t("With ") + cast, label, room), x, Math.min(y, (BTN_Y - (where.size() > 1 ? 98 : 26)) * k), label);
+
+            if (where.size() > 1) drawApps(c);
+            for (int b = 0; b < 5; b++) {
+                RectF r = buttonRect(b);
+                boolean on = row == 1 && sel == b;
+                float tx = r.left + 32 * k;
+                if (main(b)) {
+                    Frost.hero(c, r, r.height() / 2, on, k);
+                    Bitmap ic = kit.glyph(b == B_PLAY ? WheelArt.Glyph.PLAY : WheelArt.Glyph.TRAILER, 28);
+                    iconPaint.setColorFilter(new android.graphics.PorterDuffColorFilter(Frost.HERO_ICON, android.graphics.PorterDuff.Mode.SRC_IN));
+                    c.drawBitmap(ic, tx, r.centerY() - ic.getHeight() / 2f, iconPaint);
+                    tx += 38 * k;
+                } else if (on) Frost.plate(c, r, r.height() / 2, k);
+                else Frost.ghost(c, r, r.height() / 2, false, k);
+                btn.setAlpha(b == B_PLAY && !playable() ? 150 : 255);
+                c.drawText(buttonText(b), tx, r.centerY() + 9 * k, btn);
+                btn.setAlpha(255);
+            }
+            if (rating) drawRating(c, now);
+            if (stage.moving(now) || logoWaiting() || rating && now - rateAt < 500) postInvalidateOnAnimation();
+        }
+
+        /**
+         * Rating: a small glass bar over the buttons, ✕ and 1 to 10, a lit pill gliding to the chosen number and amber
+         * dots up to it. Left and Right choose, OK keeps it, Back leaves it as it was.
+         */
+        private void drawRating(Canvas c, long now) {
+            float w = 860, h = 150, slots = 11, pad = 34;
+            RectF bar = new RectF((960 - w / 2) * k, (BTN_Y - h - 36) * k, (960 + w / 2) * k, (BTN_Y - 36) * k);
+            Frost.panel(c, bar, h / 2 * k, 1, k);
+            float sw = (w - pad * 2) / slots, x0 = bar.left + pad * k, cy = bar.top + 86 * k;
+            label.setTextAlign(Paint.Align.LEFT);
+            c.drawText(L10n.t("Your rating"), bar.left + 46 * k, bar.top + 40 * k, label);
+            String hint = L10n.t("◄ ►  choose     OK  save");
+            c.drawText(hint, bar.right - 46 * k - label.measureText(hint), bar.top + 40 * k, label);
+            float at = Frost.glide(rateFrom, rateTo, now, rateAt);   // where the glider is now
+            RectF pill = new RectF(x0 + at * sw * k + 6 * k, cy - 30 * k, x0 + (at + 1) * sw * k - 6 * k, cy + 30 * k);
+            Frost.plate(c, pill, 30 * k, k);
+            btn.setTextAlign(Paint.Align.CENTER);
+            Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
+            for (int i = 0; i <= 10; i++) {
+                float mx = x0 + (i + 0.5f) * sw * k;
+                boolean chosen = i == ratingValue;
+                btn.setAlpha(chosen ? 255 : i <= ratingValue && i > 0 ? 220 : 130);
+                c.drawText(i == 0 ? "✕" : String.valueOf(i), mx, cy + 9 * k, btn);
+                if (i > 0) {
+                    dot.setColor(i <= ratingValue ? 0xFFFFC547 : 0x33FFFFFF);
+                    c.drawCircle(mx, cy + 44 * k, (i <= ratingValue ? 4.5f : 3f) * k, dot);
+                }
+            }
+            btn.setAlpha(255);
+            btn.setTextAlign(Paint.Align.LEFT);
+        }
+
+        private void rateTo(int v) {
+            long now = SystemClock.uptimeMillis();
+            rateFrom = Frost.glide(rateFrom, rateTo, now, rateAt);
+            rateTo = v;
+            rateAt = now;
+            ratingValue = v;
+        }
+
+        private boolean logoWaiting() {
+            if (SystemClock.uptimeMillis() - t.logoAskedAt > 2500) return false;
+            return !t.logoDone || t.logoUrl != null && ImageCache.get(t.logoUrl, this::postInvalidate, null, 500) == null;
+        }
+
+        /** Its cover (poster) at the panel's left, rounded; a plain glass card with its initial until it comes. */
+        private void drawCover(Canvas c) {
+            RectF r = new RectF((BOX_L + 36) * k, (BOX_T + 36) * k, (BOX_L + 36 + POSTER_W) * k, (BOX_T + BOX_H - 36) * k);
+            Bitmap p = t.poster() != null ? ImageCache.get(t.poster(), this::postInvalidate, null, Math.round(POSTER_W * k)) : null;
+            android.graphics.Path clip = new android.graphics.Path();
+            clip.addRoundRect(r, 24 * k, 24 * k, android.graphics.Path.Direction.CW);
+            c.save();
+            c.clipPath(clip);
+            if (p != null) {   // fill the card, cropping the sides or the ends
+                float sc = Math.max(r.width() / p.getWidth(), r.height() / p.getHeight());
+                float w = p.getWidth() * sc, h = p.getHeight() * sc;
+                c.drawBitmap(p, null, new RectF(r.centerX() - w / 2, r.centerY() - h / 2, r.centerX() + w / 2, r.centerY() + h / 2), stage.bits());
+            } else {
+                c.drawColor(0x22FFFFFF);
+                String i = t.title.isEmpty() ? "" : t.title.substring(0, 1).toUpperCase(Locale.ROOT);
+                title.setTextAlign(Paint.Align.CENTER);
+                c.drawText(i, r.centerX(), r.centerY() + 30 * k, title);
+                title.setTextAlign(Paint.Align.LEFT);
+            }
+            c.restore();
+        }
+
+        /** The film's logo above the panel, or its name; nothing for the moment while the logo may still come. */
+        /** Draws the logo above the panel; true when it did (then the panel leaves the name out). */
+        private boolean drawName(Canvas c) {
+            if (logoWaiting()) return false;
+            float x = BOX_L * k, bottom = (BOX_T - 28) * k;
+            Bitmap logo = t.logoUrl != null ? ImageCache.get(t.logoUrl, this::postInvalidate, null, 500) : null;
+            if (logo != null && logo.getWidth() > 0 && !Frost.darkLogo(logo)) {
+                float sc = Math.min(720 * k / logo.getWidth(), 230 * k / logo.getHeight());
+                c.drawBitmap(logo, null, new RectF(x, bottom - logo.getHeight() * sc, x + logo.getWidth() * sc, bottom), stage.bits());
+                return true;
+            }
+            return false;   // no logo: the name is in the panel, beside the cover
+        }
+
+        private String metaLine() {
+            List<String> m = new ArrayList<>();
+            m.add(t.isSeries() ? L10n.t("Series") : L10n.t("Film"));
+            if (t.year > 0) m.add(String.valueOf(t.year));
+            if (!t.genres.isEmpty()) m.add(t.genres.replace(",", " ·"));
+            if (t.runtime > 0) m.add(t.runtime >= 60 ? t.runtime / 60 + " h " + t.runtime % 60 + L10n.t(" min") : t.runtime + L10n.t(" min"));
+            if (t.rating > 0) m.add((t.jwId != null ? "IMDb " : "TMDB ") + String.format(Locale.US, "%.1f", t.rating));
+            if (t.tomato >= 0) m.add(L10n.t("Rotten Tomatoes ") + t.tomato + "%");
+            return TextUtils.join(" · ", m);
+        }
+
+        /** Where else it streams, as a row of app marks above the buttons; choosing one changes what Play opens. */
+        private void drawApps(Canvas c) {
+            float x = TEXT_L * k, y = (BTN_Y - 84) * k, h = 68 * k, w = 148 * k;
+            for (int i = 0; i < where.size() && i < 6; i++) {
+                RectF r = new RectF(x + i * (w + 12 * k), y, x + i * (w + 12 * k) + w, y + h);
+                boolean on = row == 0 && app == i;
+                if (on) Frost.plate(c, r, h / 2, k);
+                else Frost.ghost(c, r, h / 2, false, k);
+                Services.Service s = where.get(i);
+                Bitmap mark = LineIcon.appMark(s.pkg, s.name, 100 * k, 36 * k, btn.getTypeface());
+                stage.bits().setAlpha(Services.installed(getContext(), s.pkg) ? 255 : 120);
+                c.drawBitmap(mark, r.centerX() - mark.getWidth() / 2f, r.centerY() - mark.getHeight() / 2f, stage.bits());
+                stage.bits().setAlpha(255);
+            }
+        }
+
+        private static String fit(String s, Paint p, float room) {
+            return TextUtils.ellipsize(s, new TextPaint(p), room, TextUtils.TruncateAt.END).toString();
+        }
+
+        @Override
+        public boolean onKeyDown(int code, KeyEvent e) {
+            boolean left = code == KeyEvent.KEYCODE_DPAD_LEFT, right = code == KeyEvent.KEYCODE_DPAD_RIGHT;
+            boolean ok = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER;
+            if (rating) {
+                if (left || right) rateTo(Math.max(0, Math.min(10, ratingValue + (right ? 1 : -1))));
+                else if (code >= KeyEvent.KEYCODE_0 && code <= KeyEvent.KEYCODE_9) rateTo(code == KeyEvent.KEYCODE_0 ? 10 : code - KeyEvent.KEYCODE_0);
+                else if (ok) {
+                    Library.rate(getContext(), t, ratingValue);
+                    rating = false;
+                } else if (code == KeyEvent.KEYCODE_BACK) {   // as it was
+                    ratingValue = ratingWas;
+                    rating = false;
+                } else if (code == KeyEvent.KEYCODE_DPAD_UP || code == KeyEvent.KEYCODE_DPAD_DOWN) return true;
+                else return super.onKeyDown(code, e);
+                invalidate();
+                return true;
+            }
+            if (left || right) {
+                if (row == 0) app = Math.max(0, Math.min(Math.min(where.size(), 6) - 1, app + (right ? 1 : -1)));
+                else {
+                    int low = playable() ? B_PLAY : B_TRAILER;
+                    sel = Math.max(low, Math.min(B_RATE, sel + (right ? 1 : -1)));
+                }
+            } else if (code == KeyEvent.KEYCODE_DPAD_UP) {
+                if (where.size() > 1) row = 0;
+            } else if (code == KeyEvent.KEYCODE_DPAD_DOWN) {
+                row = 1;
+            } else if (ok) {
+                press();
+            } else return super.onKeyDown(code, e);
+            invalidate();
+            return true;
+        }
+
+        private void press() {
+            if (row == 0) {   // play it on the chosen app
+                row = 1;
+                sel = B_PLAY;
+                act.play(t, where.get(app));
+                return;
+            }
+            Context ctx = getContext();
+            Library.Entry en = Library.get(ctx, t);
+            switch (sel) {
+                case B_PLAY:
+                    if (inWhich() != null) act.playIn(t, inWhich());
+                    else if (!where.isEmpty()) act.play(t, where.get(Math.min(app, where.size() - 1)));
+                    break;
+                case B_TRAILER:
+                    act.trailer(t);
+                    break;
+                case B_LIST:
+                    Library.setStatus(ctx, t, en != null && en.status == Library.WANT ? Library.NONE : Library.WANT);
+                    break;
+                case B_WATCHED:
+                    Library.setStatus(ctx, t, en != null && en.status == Library.WATCHED ? Library.NONE : Library.WATCHED);
+                    break;
+                default:
+                    rating = true;
+                    ratingWas = en != null ? en.rating : 0;
+                    ratingValue = en != null && en.rating > 0 ? en.rating : 7;
+                    rateFrom = rateTo = ratingValue;
+                    rateAt = 0;
+            }
+        }
+    }
+}
