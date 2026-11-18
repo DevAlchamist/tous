@@ -110,7 +110,7 @@
 
 ### C. Safe Dynamic APK Updater
 - **`Updater.java`**:
-  - **Dynamic Repository**: Added `getRepo(ctx)` and `setRepo(ctx, repo)` reading/writing `update_repo` in `SharedPreferences`. Defaulted to `"nova/tv-town-launcher"`, freely customizable via Phone Remote Settings Dashboard.
+  - **Dynamic Repository**: Added `getRepo(ctx)` and `setRepo(ctx, repo)` reading/writing `update_repo` in `SharedPreferences`. Defaulted to `"DevAlchamist/tous"`, freely customizable via Phone Remote Settings Dashboard. Auto-cleans full GitHub git URLs (e.g. `https://github.com/DevAlchamist/tous.git`).
   - **Package Identity Verification**: Compares downloaded APK's package name with `context.getPackageName()`. Rejects mismatched packages before Android installer invocation.
   - **Signing Key Verification**: Enforces cryptographic signing compatibility using `pm.hasSigningCertificate(archiveInfo.packageName, cert, PackageManager.CERT_INPUT_SHA256)` on API 28+ with fallback to `pm.checkSignatures(context.getPackageName(), archiveInfo.packageName)`.
   - **Temporary File Isolation**: APK is downloaded over HTTPS to a temporary cache file (`.update-pending.apk`) with 200MB size limits. Only verified bytes are piped into `PackageInstaller.Session`, and temporary files are wiped in a `finally` block.

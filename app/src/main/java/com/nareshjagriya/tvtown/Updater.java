@@ -39,16 +39,27 @@ import java.util.function.Consumer;
  */
 final class Updater {
 
-    static String REPO = "nova/tv-town-launcher";
+    static String REPO = "DevAlchamist/tous";
     private static final long DAY = 24 * 3600_000L;
 
+    static String cleanRepo(String r) {
+        if (r == null) return REPO;
+        String s = r.trim();
+        if (s.startsWith("https://github.com/")) s = s.substring(19);
+        else if (s.startsWith("http://github.com/")) s = s.substring(18);
+        else if (s.startsWith("github.com/")) s = s.substring(11);
+        if (s.endsWith(".git")) s = s.substring(0, s.length() - 4);
+        while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
+        return s.isEmpty() ? REPO : s;
+    }
+
     static String getRepo(Context ctx) {
-        return prefs(ctx).getString("update_repo", REPO);
+        return cleanRepo(prefs(ctx).getString("update_repo", REPO));
     }
 
     static void setRepo(Context ctx, String repo) {
         if (repo != null && !repo.trim().isEmpty()) {
-            prefs(ctx).edit().putString("update_repo", repo.trim()).apply();
+            prefs(ctx).edit().putString("update_repo", cleanRepo(repo)).apply();
             available = null;
         }
     }
